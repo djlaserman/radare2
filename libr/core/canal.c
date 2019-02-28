@@ -674,10 +674,9 @@ static int core_anal_fcn(RCore *core, ut64 at, ut64 from, int reftype, int depth
 	}
 	int has_next = r_config_get_i (core->config, "anal.hasnext");
 	RAnalHint *hint = NULL;
-	ut8 *buf = NULL;
 	int i, nexti = 0;
 	ut64 *next = NULL;
-	int buflen, fcnlen;
+	int fcnlen;
 	RAnalFunction *fcn = r_anal_fcn_new ();
 	const char *fcnpfx = r_config_get (core->config, "anal.fcnprefix");
 	if (!fcnpfx) {
@@ -702,12 +701,6 @@ static int core_anal_fcn(RCore *core, ut64 at, ut64 from, int reftype, int depth
 	if (!fcn->name) {
 		fcn->name = r_str_newf ("%s.%08"PFMT64x, fcnpfx, at);
 	}
-	buflen = core->anal->opt.bb_max_size;
-	buf = calloc (1, buflen);
-	if (!buf) {
-		eprintf ("Error: malloc (buf)\n");
-		goto error;
-	}
 	do {
 		RFlagItem *f;
 		int delta = r_anal_fcn_size (fcn);
@@ -718,14 +711,17 @@ static int core_anal_fcn(RCore *core, ut64 at, ut64 from, int reftype, int depth
 			}
 		}
 		// TODO bring back old hack, should be fixed
-		if (!r_io_read_at (core->io, at + delta, buf, 4)) {
-			goto error;
+		{
+			ut8 buf [4];
+			if (!r_io_read_at (core->io, at + delta, buf, 4)) {
+				goto error;
+			}
 		}
-		(void)r_io_read_at (core->io, at + delta, buf, buflen);
+		// (void)r_io_read_at (core->io, at + delta, buf, buflen);
 		if (r_cons_is_breaked ()) {
 			break;
 		}
-		fcnlen = r_anal_fcn (core->anal, fcn, at + delta, buf, buflen, reftype);
+		fcnlen = r_anal_fcn (core->anal, fcn, at + delta, reftype);
 		if (core->anal->opt.searchstringrefs) {
 			r_anal_set_stringrefs (core, fcn);
 		}
@@ -758,7 +754,6 @@ static int core_anal_fcn(RCore *core, ut64 at, ut64 from, int reftype, int depth
 			if (f && *f->name && strncmp (f->name, "sect", 4)) {
 				fcn->name = strdup (f->name);
 			} else {
-
 				fcn->name = r_str_newf ("%s.%08"PFMT64x, fcnpfx, fcn->addr);
 			}
 		}
@@ -848,7 +843,6 @@ static int core_anal_fcn(RCore *core, ut64 at, ut64 from, int reftype, int depth
 			}
 		}
 	} while (fcnlen != R_ANAL_RET_END);
-	R_FREE (buf);
 
 	if (has_next) {
 		for (i = 0; i < nexti; i++) {
@@ -863,7 +857,6 @@ static int core_anal_fcn(RCore *core, ut64 at, ut64 from, int reftype, int depth
 	return true;
 
 error:
-	free (buf);
 	// ugly hack to free fcn
 	if (fcn) {
 		if (!r_anal_fcn_size (fcn) || fcn->addr == UT64_MAX) {
@@ -903,18 +896,19 @@ error:
 	return false;
 }
 
-/* decode and return the RANalOp at the address addr */
+/* decode and return the RAnalOp at the address addr */
 R_API RAnalOp* r_core_anal_op(RCore *core, ut64 addr, int mask) {
 	int len;
-	RAnalOp *op;
-	ut8 buf[128];
+	ut8 buf[32]; // TODO: honor maxinstrsize
 	ut8 *ptr;
 	RAsmOp asmop;
 
-	if (!core || addr == UT64_MAX) {
+	r_return_val_if_fail (core, NULL);
+
+	if (addr == UT64_MAX) {
 		return NULL;
 	}
-	op = R_NEW0 (RAnalOp);
+	RAnalOp *op = R_NEW0 (RAnalOp);
 	if (!op) {
 		return NULL;
 	}
@@ -951,19 +945,19 @@ err_op:
 
 static void print_hint_h_format(RAnalHint* hint) {
 	r_cons_printf (" 0x%08"PFMT64x" - 0x%08"PFMT64x" =>", hint->addr, hint->addr + hint->size);
-	HINTCMD (hint, arch, " arch='%s'", false);
-	HINTCMD (hint, bits, " bits=%d", false);
-	HINTCMD (hint, type, " type=%d", false);
-	HINTCMD (hint, size, " size=%d", false);
-	HINTCMD (hint, opcode, " opcode='%s'", false);
-	HINTCMD (hint, syntax, " syntax='%s'", false);
-	HINTCMD (hint, immbase, " immbase=%d", false);
-	HINTCMD (hint, esil, " esil='%s'", false);
+	HINTCMD (hint, arch, " arch: %s", false);
+	HINTCMD (hint, bits, " bits: %d", false);
+	HINTCMD (hint, type, " type: %d", false);
+	HINTCMD (hint, size, " size: %d", false);
+	HINTCMD (hint, opcode, " opcode:  %s", false);
+	HINTCMD (hint, syntax, " syntax: %s", false);
+	HINTCMD (hint, immbase, " immbase: %d", false);
+	HINTCMD (hint, esil, " esil: %s", false);
 	if (hint->jump != UT64_MAX) {
-		r_cons_printf (" jump: 0x%"PFMT64x, hint->jump);
+		r_cons_printf (" jump: 0x%08"PFMT64x, hint->jump);
 	}
 	if (hint->ret != UT64_MAX) {
-		r_cons_printf (" ret: 0x%"PFMT64x, hint->ret);
+		r_cons_printf (" ret: 0x%08"PFMT64x, hint->ret);
 	}
 	r_cons_newline ();
 }
@@ -1491,27 +1485,28 @@ R_API int r_core_anal_bb(RCore *core, RAnalFunction *fcn, ut64 at, int head) {
 	}
 
 	if (ret == R_ANAL_RET_NEW) { /* New bb */
-		// XXX: use static buffer size of 512 or so
-		buf = malloc (core->anal->opt.bb_max_size);
+		// XXX: use read_ahead and so on, but dont allocate that much in here
+		buflen = core->anal->opt.bb_max_size; // OMG THIS IS SO WRONG
+		buf = calloc (1, buflen);
 		if (!buf) {
 			goto error;
 		}
 		do {
+eprintf ("ULTRA SLOW OPERATION HERE :((( NOES\n");
 #if SLOW_IO
 			if (!r_io_read_at (core->io, at + bblen, buf, 4)) { // ETOOSLOW
 				goto error;
 			}
-			r_io_read_at (core->io, at + bblen, buf, core->anal->opt.bb_max_size);
+			r_io_read_at (core->io, at + bblen, buf, buflen);
 #else
-			if (!r_io_read_at (core->io, at + bblen, buf, core->anal->opt.bb_max_size)) { // ETOOSLOW
+			if (!r_io_read_at (core->io, at + bblen, buf, buflen)) {
 				goto error;
 			}
 #endif
 			if (!r_io_is_valid_offset (core->io, at + bblen, !core->anal->opt.noncode)) {
 				goto error;
 			}
-			buflen = core->anal->opt.bb_max_size;
-			bblen = r_anal_bb (core->anal, bb, at+bblen, buf, buflen, head);
+			bblen = r_anal_bb (core->anal, bb, at + bblen, buf, buflen, head);
 			if (bblen == R_ANAL_RET_ERROR || (bblen == R_ANAL_RET_END && bb->size < 1)) { /* Error analyzing bb */
 				goto error;
 			}
@@ -2897,11 +2892,7 @@ R_API void r_core_recover_vars(RCore *core, RAnalFunction *fcn, bool argonly) {
 	if (!core || !core->anal || !fcn || core->anal->opt.bb_max_size < 1) {
 		return;
 	}
-	int bb_size = core->anal->opt.bb_max_size;
-	ut8 *buf = calloc (1, bb_size);
-	if (!buf) {
-		return;
-	}
+	const int max_bb_size = core->anal->opt.bb_max_size;
 	r_list_foreach (fcn->bbs, tmp, bb) {
 		if (r_cons_is_breaked ()) {
 			break;
@@ -2909,12 +2900,8 @@ R_API void r_core_recover_vars(RCore *core, RAnalFunction *fcn, bool argonly) {
 		if (bb->size < 1) {
 			continue;
 		}
-		if (bb->size > bb_size) {
+		if (bb->size > max_bb_size) {
 			continue;
-		}
-		if (!r_io_read_at (core->io, bb->addr, buf, bb->size)) {
-			//eprintf ("read error\n");
-			break;
 		}
 		pos = bb->addr;
 		while (pos < bb->addr + bb->size) {
@@ -2926,9 +2913,9 @@ R_API void r_core_recover_vars(RCore *core, RAnalFunction *fcn, bool argonly) {
 				//eprintf ("Cannot get op\n");
 				break;
 			}
-			extract_rarg (core->anal, op, fcn, reg_set, &count);
+			r_anal_extract_rarg (core->anal, op, fcn, reg_set, &count);
 			if (!argonly) {
-				extract_vars (core->anal, fcn, op);
+				r_anal_extract_vars (core->anal, fcn, op);
 			}
 			int opsize = op->size;
 			r_anal_op_free (op);
@@ -2938,7 +2925,6 @@ R_API void r_core_recover_vars(RCore *core, RAnalFunction *fcn, bool argonly) {
 			pos += opsize;
 		}
 	}
-	free (buf);
 	return;
 }
 
