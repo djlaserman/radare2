@@ -65,42 +65,29 @@ R_API const char *r_anal_fcn_type_tostring(int type) {
 #if READ_AHEAD
 // TODO: move into io :?
 static int read_ahead(RAnal *anal, ut64 addr, ut8 *buf, int len) {
-	if (len < 1) {
-		return 0;
-	}
 	static ut8 cache[1024];
 	static ut64 cache_addr = UT64_MAX;
 	const int cache_len = sizeof (cache);
-	bool isCached = (addr >= cache_addr && (addr < (cache_addr + cache_len)) && (addr + len) < (cache_addr + cache_len));
-	if (len > cache_len) {
-		return anal->iob.read_at (anal->iob.io, addr, buf, len); // double read
+
+	if (len < 1) {
+		return 0;
 	}
-	if (cache_addr == UT64_MAX || !isCached) {
-		if (len > cache_len) {
-			anal->iob.read_at (anal->iob.io, addr, buf, len);
-			memcpy (cache, buf, cache_len);
-		} else {
-			anal->iob.read_at (anal->iob.io, addr, cache, sizeof (cache));
-			memcpy (buf, cache, len);
-		}
+	if (len > cache_len) {
+		int a = anal->iob.read_at (anal->iob.io, addr, buf, len); // double read
+		memcpy (cache, buf, cache_len);
 		cache_addr = addr;
+		return a;
+	}
+
+	ut64 addr_end = UT64_ADD_OVFCHK (addr, len)? UT64_MAX: addr + len;
+	ut64 cache_addr_end = UT64_ADD_OVFCHK (cache_addr, cache_len)? UT64_MAX: cache_addr + cache_len;
+	bool isCached = ((addr != UT64_MAX) && (addr >= cache_addr) && (addr_end < cache_addr_end));
+	if (isCached) {
+		memcpy (buf, cache + (addr - cache_addr), len);
 	} else {
-		if (isCached) {
-			if ((addr >= cache_addr) && addr < (cache_addr + cache_len) && (addr + len) < (cache_addr + cache_len)) {
-				if (addr > cache_addr + cache_len) {
-					anal->iob.read_at (anal->iob.io, addr, buf, len);
-				} else {
-					memcpy (buf, cache + (addr - cache_addr), len);
-				}
-			} else {
-				anal->iob.read_at (anal->iob.io, addr, buf, len);
-				// worth caching?
-		//		memcpy (cache, buf, cache_len);
-		//		cache_addr = addr;
-			}
-		} else {
-			// should not be reachable
-		}
+		anal->iob.read_at (anal->iob.io, addr, cache, sizeof (cache));
+		memcpy (buf, cache, len);
+		cache_addr = addr;
 	}
 	return len;
 }
@@ -1025,9 +1012,8 @@ static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, int depth) {
 		r_list_free (list);
 	}
 	ut64 movptr = UT64_MAX; // used by jmptbl when coded as "mov reg,[R*4+B]"
-	int len = anal->opt.bb_max_size;
 	ut8 buf[32]; // 32 bytes is enough to hold any instruction.
-	while (addrbytes * idx < len) {
+	while (addrbytes * idx < anal->opt.bb_max_size) {
 		if (anal->limit && anal->limit->to <= addr + idx) {
 			break;
 		}
@@ -1056,17 +1042,14 @@ repeat:
 			RCore *core = anal->coreb.core;
 			if (!core || !core->bin || !core->bin->is_debugger) { // HACK
 				ut8 v = 0;
-				if (addrbytes * (idx + 3) < len) {
-					v += buf[0] == 0xff;
-					v += buf[1] == 0xff;
-					v += buf[2] == 0xff;
-					v += buf[3] == 0xff;
-				}
-				if (v < 2) {
+				v += buf[0] == 0xff;
+				v += buf[1] == 0xff;
+				v += buf[2] == 0xff;
+				v += buf[3] == 0xff;
+				if (v > 1) {
 					// check if this is data, then just skip
-					const char *reason = (len - (addrbytes * idx) < 4)? "Truncated": "Invalid";
-					eprintf ("%s instruction of %d bytes at 0x%"PFMT64x"\n",
-							reason, (int)(len - (addrbytes * idx)), addr + idx);
+					eprintf ("Invalid instruction of %d bytes at 0x%"PFMT64x"\n",
+						(int)(anal->opt.bb_max_size - (addrbytes * idx)), addr + idx);
 				}
 			}
 			gotoBeach (R_ANAL_RET_END);
